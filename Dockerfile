@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py mcp_helper.py mcp_session.py oauth_storage.py .
+COPY main.py mcp_helper.py mcp_session.py oauth_storage.py tool_policy.py .
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
