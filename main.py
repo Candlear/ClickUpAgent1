@@ -24,6 +24,7 @@ from slowapi.util import get_remote_address
 
 from mcp_helper import mcp_tools_to_gemini_declarations
 from mcp_session import MCPManager
+from tool_policy import filter_mcp_tools, is_tool_allowed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -138,7 +139,17 @@ async def _run_agent_pipeline(manager: MCPManager, user_message: str) -> dict[st
 
     _configure_gemini()
 
-    mcp_tools = await manager.list_tools()
+    mcp_tools_raw = await manager.list_tools()
+    n_raw = len(mcp_tools_raw)
+    mcp_tools = filter_mcp_tools(mcp_tools_raw)
+    n_blocked = n_raw - len(mcp_tools)
+    if n_blocked:
+        logger.info(
+            "MCP tool policy: %d tools from server, %d exposed to Gemini, %d blocked",
+            n_raw,
+            len(mcp_tools),
+            n_blocked,
+        )
     declarations = mcp_tools_to_gemini_declarations(mcp_tools)
     if not declarations:
         return {
@@ -219,6 +230,16 @@ async def _run_agent_pipeline(manager: MCPManager, user_message: str) -> dict[st
             return {
                 "ok": False,
                 "error": "unknown_tool_from_gemini",
+                "tool_name": tool_name,
+                "stopped_reason": "error",
+                "steps": steps,
+            }
+
+        if not is_tool_allowed(tool_name):
+            logger.warning("Blocked tool call by policy: %s", tool_name)
+            return {
+                "ok": False,
+                "error": "tool_blocked_by_policy",
                 "tool_name": tool_name,
                 "stopped_reason": "error",
                 "steps": steps,
@@ -307,6 +328,18 @@ async def ready(request: Request) -> dict[str, Any]:
     }
 
 
+def _oauth_failure_detail(exc: Exception) -> str:
+    text = str(exc)
+    if "allowlist" in text.lower() or "allowlisted" in text.lower():
+        return (
+            "ClickUp hat die OAuth-Registrierung abgelehnt: Eure Integration steht noch "
+            "nicht auf der ClickUp-MCP-Allowlist. Antrag: "
+            "https://forms.clickup-stg.com/333/f/ad-3426753/WF90UVNDA3H2GXA6TD — "
+            "Alternativ: CLICKUP_MCP_MODE=community_stdio und CLICKUP_API_KEY in Railway setzen."
+        )
+    return text[:2000]
+
+
 @app.get("/oauth/start")
 async def oauth_start(request: Request) -> RedirectResponse:
     mgr: MCPManager = request.app.state.mcp
@@ -317,20 +350,46 @@ async def oauth_start(request: Request) -> RedirectResponse:
         )
 
     async def run_oauth() -> None:
-        try:
-            await mgr.begin_interactive_oauth_connection()
-        except Exception:
-            logger.exception("Interactive OAuth / MCP connect failed")
+        await mgr.begin_interactive_oauth_connection()
 
-    asyncio.create_task(run_oauth())
+    run_task = asyncio.create_task(run_oauth())
+    redirect_task = asyncio.create_task(mgr.wait_for_redirect_url(120.0))
+    done, _pending = await asyncio.wait(
+        {run_task, redirect_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    if redirect_task in done:
+        try:
+            url = redirect_task.result()
+        except Exception as e:
+            run_task.cancel()
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail=_oauth_failure_detail(e),
+            ) from e
+        return RedirectResponse(url, status_code=302)
+
+    redirect_task.cancel()
     try:
-        url = await mgr.wait_for_redirect_url(timeout=120.0)
-    except asyncio.TimeoutError:
+        await redirect_task
+    except asyncio.CancelledError:
+        pass
+    exc = run_task.exception()
+    if exc is not None:
+        logger.exception("Interactive OAuth / MCP connect failed")
         raise HTTPException(
-            status_code=504,
-            detail="OAuth redirect URL was not produced in time",
-        ) from None
-    return RedirectResponse(url, status_code=302)
+            status_code=503,
+            detail=_oauth_failure_detail(exc),
+        ) from exc
+    raise HTTPException(
+        status_code=503,
+        detail="OAuth ended before redirect URL was available",
+    )
 
 
 @app.get("/oauth/callback")

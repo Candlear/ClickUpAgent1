@@ -29,6 +29,13 @@ DEFAULT_MCP_URL = "https://mcp.clickup.com/mcp"
 DEFAULT_TOKEN_PATH = "/data/clickup_oauth.json"
 
 
+def _env_mode() -> str:
+    """Railway/UI kopiert manchmal Werte mit Anführungszeichen — die entfernen."""
+    raw = (os.getenv("CLICKUP_MCP_MODE") or CLICKUP_MCP_MODE_COMMUNITY).strip()
+    raw = raw.strip('"').strip("'")
+    return raw.lower()
+
+
 def _unpack_streamable_streams(streams: Any) -> tuple[Any, Any]:
     if isinstance(streams, tuple) and len(streams) >= 2:
         return streams[0], streams[1]
@@ -39,7 +46,7 @@ class MCPManager:
     """Eine ClientSession, serialisiert mit Lock; Reconnect bei Bedarf."""
 
     def __init__(self) -> None:
-        self.mode = (os.getenv("CLICKUP_MCP_MODE") or CLICKUP_MCP_MODE_COMMUNITY).strip().lower()
+        self.mode = _env_mode()
         self.mcp_url = (os.getenv("CLICKUP_MCP_URL") or DEFAULT_MCP_URL).strip()
         token_path = (os.getenv("CLICKUP_OAUTH_TOKEN_PATH") or DEFAULT_TOKEN_PATH).strip()
         self._storage = FileTokenStorage(token_path)
@@ -160,9 +167,25 @@ class MCPManager:
                 logger.info("Hosted MCP session initialized after OAuth")
             except Exception:
                 try:
+                    await asyncio.sleep(0)
                     await self._disconnect()
+                except RuntimeError as re:
+                    if "cancel scope" in str(re).lower() or "different task" in str(
+                        re
+                    ).lower():
+                        logger.warning(
+                            "OAuth teardown skipped (async context race): %s", re
+                        )
+                        self._stack = AsyncExitStack()
+                        self._session = None
+                        self._http_client = None
+                    else:
+                        raise
                 except Exception:
                     logger.exception("Cleanup after failed OAuth connect")
+                    self._stack = AsyncExitStack()
+                    self._session = None
+                    self._http_client = None
                 raise
             finally:
                 self._oauth_flow_active = False
