@@ -31,6 +31,37 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
+def _pick_json_schema_type(types_list: list[Any]) -> str:
+    """JSON-Schema-Unions (type als Liste); Gemini braucht einen einzelnen Typ-String."""
+    non_null = [x for x in types_list if x != "null" and x is not None]
+    if not non_null:
+        return "string"
+    # Bevorzugt gängige Typen, sonst erstes Element
+    for preferred in ("object", "array", "string", "number", "integer", "boolean"):
+        if preferred in non_null:
+            return preferred
+    first = non_null[0]
+    return str(first) if first is not None else "string"
+
+
+def normalize_json_schema_for_gemini(schema: Any) -> Any:
+    """
+    Rekursiv: `type`-Felder, die Listen sind (Union), in einen String verwandeln.
+    Sonst schlägt google.generativeai mit "'list' object has no attribute 'upper'" fehl.
+    """
+    if isinstance(schema, dict):
+        out: dict[str, Any] = {}
+        for k, v in schema.items():
+            if k == "type" and isinstance(v, list):
+                out[k] = _pick_json_schema_type(v)
+            else:
+                out[k] = normalize_json_schema_for_gemini(v)
+        return out
+    if isinstance(schema, list):
+        return [normalize_json_schema_for_gemini(x) for x in schema]
+    return schema
+
+
 def build_stdio_params() -> StdioServerParameters:
     package = os.getenv("CLICKUP_MCP_NPX_PACKAGE", _DEFAULT_NPX_PACKAGE).strip()
     extra = os.getenv("CLICKUP_MCP_NPX_ARGS", "")
@@ -60,6 +91,7 @@ def mcp_tools_to_gemini_declarations(
             schema = {"type": "object", "properties": {}}
         if schema.get("type") != "object":
             schema = {"type": "object", "properties": {"value": schema}}
+        schema = normalize_json_schema_for_gemini(schema)
         declarations.append(
             {
                 "name": t.name,
